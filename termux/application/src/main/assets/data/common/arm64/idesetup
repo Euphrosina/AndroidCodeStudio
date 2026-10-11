@@ -1,0 +1,315 @@
+#!/data/data/com.tom.rv2ide/files/usr/bin/bash
+#
+# Android Code Studio - IDE Setup script (SDK 33 - 37)
+#
+# Replaces the original SHC-compiled installer with an auditable, plain
+# shell implementation. Adds:
+#   - SDK 35.0.1 / 36.1.0 / 37.0.0 (arm64) support
+#   - sha256 integrity verification for all downloads
+#   - automatic platform (android.jar) installation for SDK 35/36/37
+#
+# Component sources:
+#   - SDK 33/34 : AndroidIDE community packages (as before)
+#   - SDK 35/36/37 : ACS repackaged bundles (ReVanced aapt2 + Google jars)
+#   - platforms 35/36/37 : official Google platform zips (arch-independent)
+#
+set -eu
+
+Color_Off='\033[0m'
+Red='\033[0;31m'
+Green='\033[0;32m'
+Blue='\033[0;34m'
+Orange="\e[38;5;208m"
+
+yes='^[Yy][Ee]?[Ss]?$'
+
+# ---- Defaults ----
+arch=$(uname -m)
+install_dir=$HOME
+sdkver_org=34.0.4
+with_cmdline=true
+assume_yes=false
+pkgm="pkg"
+pkg_curl="libcurl"
+pkgs="jq tar unzip"
+jdk_version="17"
+ndk_version="0"
+with_git=false
+with_openssh=false
+
+# SDK component manifest. Overridable with -m/--manifest.
+# Default points to the ACS-managed manifest which covers SDK 33-37.
+manifest="https://raw.githubusercontent.com/Euphrosina/acs-sdk/main/manifest.json"
+
+print_info()    { printf "${Blue}$1$Color_Off\n"; }
+print_err()     { printf "${Red}$1$Color_Off\n"; }
+print_warn()    { printf "${Orange}$1$Color_Off\n"; }
+print_success() { printf "${Green}$1$Color_Off\n"; }
+
+is_yes() { [[ "$1" =~ $yes ]]; }
+
+help() {
+  echo "Usage: $0 [OPTIONS]"
+  echo ""
+  echo "Installs Android SDK build tools for Android Code Studio."
+  echo ""
+  echo "Options:"
+  echo "  --sdk VERSION        Android SDK (build tools) version to install."
+  echo "                       Supported: 33.0.1-34.0.4, 35.0.1, 36.1.0 (arm64), 37.0.0 (arm64)"
+  echo "  --jdk VERSION        OpenJDK version: '17' or '21'"
+  echo "  --ndk VERSION        NDK version. Use '0' to skip."
+  echo "  --install-dir DIR    Installation directory. Default: \$HOME"
+  echo "  --assume-yes         Assume 'yes' for all prompts."
+  echo "  --with-git           Install git."
+  echo "  --with-openssh       Install openssh."
+  echo "  --manifest URL       SDK component manifest URL."
+  echo "  -h, --help           Show this help."
+}
+
+# ---- Parse arguments (GNU long options, sent by the IDE) ----
+# Note: the IDE's Kotlin helper appends an empty string after flags that take
+# no value (e.g. `--assume-yes` becomes ["--assume-yes", ""]). Silently skip
+# empty arguments so this does not abort the installer.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    "")            shift ;;
+    --sdk)          sdkver_org="$2"; shift 2 ;;
+    --jdk)          jdk_version="$2"; shift 2 ;;
+    --ndk)          ndk_version="$2"; shift 2 ;;
+    --install-dir)  install_dir="$2"; shift 2 ;;
+    --assume-yes)   assume_yes=true; shift ;;
+    --with-git)     with_git=true; shift ;;
+    --with-openssh) with_openssh=true; shift ;;
+    --manifest|-m)  manifest="$2"; shift 2 ;;
+    -h|--help)      help; exit 0 ;;
+    -s)             sdkver_org="$2"; shift 2 ;;
+    -j)             jdk_version="$2"; shift 2 ;;
+    -y)             assume_yes=true; shift ;;
+    -c)             with_cmdline=true; shift ;;
+    *) print_err "Unknown option: $1"; help; exit 1 ;;
+  esac
+done
+
+sdkver="$sdkver_org"
+
+print_info "Installing Android SDK $sdkver for arch=$arch..."
+
+# ---- New-generation SDKs: arm64 only ----
+case "$sdkver" in
+  36.1.0|37.0.0)
+    if [ "$arch" != "aarch64" ]; then
+      print_err "SDK $sdkver is only available for arm64 (aarch64) devices."
+      print_err "Your architecture: $arch. Please select SDK 34.0.4 or lower."
+      exit 1
+    fi
+    ;;
+esac
+
+# ---- Map build-tools version to platform ----
+platform_key=""
+case "$sdkver" in
+  35.0.1)  platform_key="_35_0_1" ;;
+  36.1.0)  platform_key="_36_1_0" ;;
+  37.0.0)  platform_key="_37_0_0" ;;
+esac
+
+# ---- Termux package dependencies ----
+print_info "Installing required packages ($pkgs)..."
+$pkgm install -y $pkgs $pkg_curl 2>/dev/null || $pkgm install -y $pkgs
+
+# ---- Download manifest ----
+# termux has no /tmp; use $TMPDIR (termux sets it to $PREFIX/tmp)
+downloaded_manifest=$(mktemp "${TMPDIR:-/tmp}/acs-manifest.XXXXXX.json")
+print_info "Fetching component manifest..."
+curl -L --http1.1 --retry 6 --retry-delay 3 --retry-all-errors -o "$downloaded_manifest" "$manifest" -s
+print_success "Manifest fetched."
+
+# jq helper
+jqget() { jq -r "$1" "$downloaded_manifest" 2>/dev/null; }
+
+# ---- SDK layout ----
+SYSROOT="$install_dir"
+sdk_dir="$SYSROOT/android-sdk"
+mkdir -p "$sdk_dir"
+
+download_and_verify() {
+  # $1 = name, $2 = url, $3 = dest file, $4 = sha256 (may be empty)
+  local name="$1" url="$2" dest="$3" checksum="$4"
+  if [ ! -f "$dest" ]; then
+    print_info "Downloading $name..."
+    # --retry-all-errors: network drops (SSL eof / reset) are retried, not fatal.
+    # -C -: resume partial downloads on retry (mobile networks to GitHub are flaky).
+    curl -L --http1.1 --retry 8 --retry-delay 3 --retry-all-errors -C - -o "$dest" "$url" -#
+  fi
+  if [ -n "$checksum" ] && [ "$checksum" != "null" ]; then
+    print_info "Verifying $name..."
+    actual=$(sha256sum "$dest" | awk '{print $1}')
+    if [ "$actual" != "$checksum" ]; then
+      print_err "Checksum verification FAILED for $name"
+      print_err "  expected: $checksum"
+      print_err "  actual:   $actual"
+      rm -f "$dest"
+      exit 1
+    fi
+    print_success "$name checksum OK."
+  fi
+}
+
+extract_tar_xz() {
+  # $1 = archive, $2 = dest dir
+  print_info "Extracting $1..."
+  mkdir -p "$2"
+  tar -xJf "$1" -C "$2"
+}
+
+extract_zip() {
+  # $1 = archive, $2 = dest dir
+  print_info "Extracting $1..."
+  mkdir -p "$2"
+  unzip -q -o "$1" -d "$2"
+}
+
+# ---- 1. Base SDK (licenses + layout) ----
+android_sdk_url=$(jqget '.android_sdk')
+if [ -n "$android_sdk_url" ] && [ "$android_sdk_url" != "null" ]; then
+  if [ ! -d "$sdk_dir/platforms" ]; then
+    print_info "Installing base Android SDK..."
+    f="$SYSROOT/android-sdk.tar.xz"
+    download_and_verify "android-sdk" "$android_sdk_url" "$f" "$(jqget '.sha256["android_sdk"]')"
+    extract_tar_xz "$f" "$SYSROOT"
+    rm -f "$f"
+    print_success "Base Android SDK installed."
+  else
+    print_info "Base Android SDK already present. Skipping."
+  fi
+fi
+
+# ---- 2. Build tools ----
+# version key: 35.0.1 -> _35_0_1
+bt_key="$(echo "$sdkver" | tr '.' '_')"
+bt_key="_${bt_key}"
+bt_url=$(jqget ".build_tools.$arch.$bt_key")
+if [ -z "$bt_url" ] || [ "$bt_url" == "null" ]; then
+  print_err "Build tools $sdkver for $arch not found in manifest."
+  print_err "Supported versions for $arch:"
+  jqget ".build_tools.$arch | keys[]" | sed 's/_/./g;s/^\.//'
+  exit 1
+fi
+
+bt_dir="$sdk_dir/build-tools/$sdkver"
+if [ -d "$bt_dir" ] && [ -x "$bt_dir/aapt2" ]; then
+  print_info "Build tools $sdkver already installed. Skipping."
+else
+  f="$SYSROOT/build-tools-$sdkver.tar.xz"
+  bt_sha=$(jqget ".sha256[\"build_tools.$arch.$bt_key\"]")
+  download_and_verify "build-tools $sdkver ($arch)" "$bt_url" "$f" "$bt_sha"
+  extract_tar_xz "$f" "$sdk_dir"
+  rm -f "$f"
+  print_success "Build tools $sdkver installed at $bt_dir"
+fi
+
+# ---- 3. Platform (android.jar) for new-generation SDKs ----
+if [ -n "$platform_key" ]; then
+  pf_url=$(jqget ".platforms.$platform_key.url")
+  pf_sha=$(jqget ".platforms.$platform_key.sha256")
+  pf_dir_name=$(jqget ".platforms.$platform_key.dir")
+  pf_alias=$(jqget ".platforms.$platform_key.alias")
+  if [ -n "$pf_url" ] && [ "$pf_url" != "null" ]; then
+    pf_install_dir="$sdk_dir/platforms/$pf_dir_name"
+    if [ -d "$pf_install_dir" ] && [ -f "$pf_install_dir/android.jar" ]; then
+      print_info "Platform $pf_dir_name already installed. Skipping."
+    else
+      f="$SYSROOT/platform-$sdkver.zip"
+      download_and_verify "platform $pf_dir_name" "$pf_url" "$f" "$pf_sha"
+      extract_zip "$f" "$sdk_dir/platforms"
+      rm -f "$f"
+      # Create alias symlink (android-37.0 -> android-37) so that projects
+      # with compileSdk 37 can resolve the platform.
+      if [ -n "$pf_alias" ] && [ "$pf_alias" != "null" ]; then
+        cd "$sdk_dir/platforms"
+        [ -e "$pf_alias" ] || ln -s "$pf_dir_name" "$pf_alias"
+        cd - >/dev/null
+      fi
+      print_success "Platform $pf_dir_name installed."
+    fi
+  fi
+fi
+
+# ---- 4. Platform tools ----
+pt_key="_34_0_4"
+pt_url=$(jqget ".platform_tools.$arch.$pt_key")
+if [ -z "$pt_url" ] || [ "$pt_url" == "null" ]; then
+  # fall back to any available platform-tools entry
+  pt_url=$(jqget ".platform_tools.$arch | to_entries[0].value")
+fi
+if [ ! -d "$sdk_dir/platform-tools" ]; then
+  print_info "Installing platform tools..."
+  f="$SYSROOT/platform-tools.tar.xz"
+  download_and_verify "platform-tools ($arch)" "$pt_url" "$f" ""
+  extract_tar_xz "$f" "$sdk_dir"
+  rm -f "$f"
+  print_success "Platform tools installed."
+else
+  print_info "Platform tools already installed. Skipping."
+fi
+
+# ---- 5. Command line tools ----
+if [ "$with_cmdline" = "true" ] && [ ! -d "$sdk_dir/cmdline-tools/latest" ]; then
+  clt_url=$(jqget '.cmdline_tools')
+  if [ -n "$clt_url" ] && [ "$clt_url" != "null" ]; then
+    print_info "Installing command line tools..."
+    f="$SYSROOT/cmdline-tools.tar.xz"
+    download_and_verify "cmdline-tools" "$clt_url" "$f" "$(jqget '.sha256["cmdline_tools"]')"
+    extract_tar_xz "$f" "$sdk_dir"
+    rm -f "$f"
+    print_success "Command line tools installed."
+  fi
+fi
+
+# ---- 6. JDK ----
+jdk_pkg=""
+case "$jdk_version" in
+  17) jdk_pkg="openjdk-17" ;;
+  21) jdk_pkg="openjdk-21" ;;
+  *) print_warn "Unknown JDK version $jdk_version. Defaulting to 17."; jdk_pkg="openjdk-17" ;;
+esac
+if ! command -v javac >/dev/null 2>&1; then
+  print_info "Installing $jdk_pkg..."
+  $pkgm install -y "$jdk_pkg"
+fi
+
+# ---- 7. NDK ----
+if [ "$ndk_version" != "0" ]; then
+  print_warn "NDK $ndk_version installation is not automated in this build."
+  print_warn "If you need NDK, follow the on-device docs after setup completes."
+fi
+
+# ---- 8. Optional tools ----
+if [ "$with_git" = "true" ]; then
+  command -v git >/dev/null 2>&1 || { print_info "Installing git..."; $pkgm install -y git; }
+fi
+if [ "$with_openssh" = "true" ]; then
+  command -v ssh >/dev/null 2>&1 || { print_info "Installing openssh..."; $pkgm install -y openssh; }
+fi
+
+# ---- 9. ide-environment.properties ----
+jdk_dir="$SYSROOT/opt/openjdk"
+[ -d "$jdk_dir" ] || jdk_dir=$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")
+
+print_info "Updating ide-environment.properties..."
+props_dir="$SYSROOT/etc"
+props="$props_dir/ide-environment.properties"
+mkdir -p "$props_dir"
+
+if [ ! -e "$props" ]; then
+  printf "JAVA_HOME=%s" "$jdk_dir" >"$props" && print_success "Properties file updated successfully!"
+else
+  if [ "$assume_yes" = "true" ] || is_yes "ide-environment.properties already exists. Overwrite? [y/N] "; then
+    printf "JAVA_HOME=%s" "$jdk_dir" >"$props" && print_success "Properties file updated successfully!"
+  else
+    print_warn "Manually edit $props and set JAVA_HOME and ANDROID_SDK_ROOT."
+  fi
+fi
+
+rm -vf "$downloaded_manifest"
+print_success "Setup complete. Android SDK $sdkver is ready."

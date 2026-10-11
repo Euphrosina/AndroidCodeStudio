@@ -1,0 +1,130 @@
+name: Build Android Code Studio
+
+on:
+  push:
+    branches: 
+      - "dev"
+      - "main" 
+      - "indexing"
+      - "release/**"
+    paths-ignore:
+      - '**.md'
+      - '**.json'
+      - 'fastlane/**'
+      - '.github/workflows/crowdin_contributors.yml'
+  pull_request:
+    branches: [ "dev" ]
+    paths-ignore:
+      - '**.md'
+      - '**.json'
+      - 'fastlane/**'
+      - '.github/workflows/crowdin_contributors.yml'
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Select Build Type'
+        required: true
+        default: 'Debug'
+        type: choice
+        options:
+          - Debug
+          - Release
+
+jobs:
+  build_release_apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel previous runs
+        uses: styfle/cancel-workflow-action@0.12.1
+        with:
+          access_token: ${{ github.token }}
+          
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+
+      - name: Determine Build Type Configuration
+        run: |
+          SELECTED_TYPE="${{ github.event.inputs.build_type }}"
+          BUILD_TYPE="${SELECTED_TYPE:-Debug}"
+          echo "BUILD_TYPE=$BUILD_TYPE" >> $GITHUB_ENV
+          echo "BUILD_TYPE_LOWER=$(echo "$BUILD_TYPE" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'adopt'
+
+      - name: Generating missing dirs
+        run: mkdir -p /home/runner/work/android-code-studio/android-code-studio/core/app/build/intermediates/external_file_lib_dex_archives/debug/desugarDebugFileDependencies && mkdir -p /home/runner/work/android-code-studio/android-code-studio/core/app/build/intermediates/l8_art_profile/release/l8DexDesugarLibRelease
+
+      - name: Change Gradle wrapper permissions
+        run: chmod +x ./gradlew
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-v2-${{ hashFiles('**/*.gradle*') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # SECURITY FIX: the signing keystore is no longer taken from the
+      # repository (signing/signing-key.jks is removed from git). CI must
+      # provide the keystore as a base64-encoded GitHub secret
+      # (SIGNING_KEY_BASE64). Without it, the build falls back to an
+      # unsigned APK — it never signs with a publicly visible key.
+      - name: Decode signing keystore
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.SIGNING_KEY_BASE64 }}
+        run: |
+          if [ -n "$SIGNING_KEY_BASE64" ]; then
+            echo "$SIGNING_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/signing.jks"
+            echo "ACS_STORE_FILE=$RUNNER_TEMP/signing.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No SIGNING_KEY_BASE64 secret set — build will be unsigned."
+          fi
+
+      - name: Assemble APK
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD || secrets.SIGNING_SK_PASSWORD }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD || secrets.SIGNING_SK_PASSWORD }}
+          ACS_KEY_ALIAS: ${{ secrets.ACS_KEY_ALIAS || 'androidcs' }}
+        run: ./gradlew assemble${{ env.BUILD_TYPE }}
+
+      - name: List APK files
+        run: ls -la core/app/build/outputs/apk/${{ env.BUILD_TYPE_LOWER }}/ || echo "Directory not found"
+
+      - name: Upload arm64-v8a APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-arm64-v8a-${{ env.BUILD_TYPE_LOWER }}
+          path: core/app/build/outputs/apk/${{ env.BUILD_TYPE_LOWER }}/*arm64-v8a*.apk
+        if: always()
+
+      - name: Upload armeabi-v7a APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-armeabi-v7a-${{ env.BUILD_TYPE_LOWER }}
+          path: core/app/build/outputs/apk/${{ env.BUILD_TYPE_LOWER }}/*armeabi-v7a*.apk
+        if: always()
+
+      - name: Upload x86_64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-x86_64-${{ env.BUILD_TYPE_LOWER }}
+          path: core/app/build/outputs/apk/${{ env.BUILD_TYPE_LOWER }}/*x86_64*.apk
+        if: always()
+
+      - name: Upload universal APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-universal-${{ env.BUILD_TYPE_LOWER }}
+          path: core/app/build/outputs/apk/${{ env.BUILD_TYPE_LOWER }}/*universal*.apk
+        if: always()
