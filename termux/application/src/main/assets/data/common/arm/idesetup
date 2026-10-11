@@ -137,9 +137,24 @@ download_and_verify() {
   local name="$1" url="$2" dest="$3" checksum="$4"
   if [ ! -f "$dest" ]; then
     print_info "Downloading $name..."
-    # --retry-all-errors: network drops (SSL eof / reset) are retried, not fatal.
-    # -C -: resume partial downloads on retry (mobile networks to GitHub are flaky).
-    curl -L --http1.1 --retry 8 --retry-delay 3 --retry-all-errors -C - -o "$dest" "$url" -#
+    # NO '-C -' here: resume + --retry on flaky mobile networks produced
+    # corrupted files (offset overlapping). Instead: curl-internal retry
+    # (which restarts the transfer cleanly) wrapped in a bash-level loop
+    # that removes any partial file before each attempt.
+    local attempt=0
+    while [ "$attempt" -lt 5 ]; do
+      rm -f "$dest"
+      if curl -L --http1.1 --retry 4 --retry-delay 3 --retry-all-errors -o "$dest" "$url" -#; then
+        break
+      fi
+      attempt=$((attempt + 1))
+      print_warn "Download of $name failed (attempt $attempt/5). Retrying in 5s..."
+      sleep 5
+    done
+    if [ ! -s "$dest" ]; then
+      print_err "Failed to download $name after 5 attempts."
+      exit 1
+    fi
   fi
   if [ -n "$checksum" ] && [ "$checksum" != "null" ]; then
     print_info "Verifying $name..."
